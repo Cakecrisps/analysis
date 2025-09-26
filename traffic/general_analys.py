@@ -88,7 +88,7 @@ def classify_suspicious_domain(domain):
     return reasons
 
 
-def analyze_single_pcap_file(pcap_path):
+def analyze_single_pcap_file(pcap_path, ignore_local_ips):
     """Анализирует один PCAP файл и возвращает собранные данные"""
     print(f"[INFO] Анализируем файл: {pcap_path}")
 
@@ -96,23 +96,36 @@ def analyze_single_pcap_file(pcap_path):
     src_ips = []
     dst_ips = []
     dns_queries = []
+    nbns_queries = []  # NetBIOS Name Service
     unique_ips = set()
     suspicious_domains = []  # [(domain, time, reasons)]
     suspicious_ips = set()
     http_requests = {}  # domain -> list of URLs
     domain_count = Counter()  # domain -> count
+    protocol_stats = Counter()  # протокол -> count
+    login_attempts = []  # [(src_ip, dst_ip, username, protocol, time)]
 
     try:
         cap = pyshark.FileCapture(pcap_path, keep_packets=False)
         for pkt in cap:
+            # Подсчет протоколов
+            if hasattr(pkt, 'transport_layer'):
+                protocol_stats[pkt.transport_layer] = protocol_stats.get(pkt.transport_layer, 0) + 1
+            else:
+                # Если нет транспортного слоя, проверяем другие протоколы
+                for layer in pkt.layers:
+                    protocol_stats[str(layer.layer_name)] = protocol_stats.get(str(layer.layer_name), 0) + 1
+
             # Обработка IP-адресов
             if 'IP' in pkt:
                 src_ip = pkt.ip.src
                 dst_ip = pkt.ip.dst
-                if not is_local_ip(src_ip):
+
+                # Проверяем, нужно ли игнорировать локальные IP
+                if not ignore_local_ips or not is_local_ip(src_ip):
                     src_ips.append(src_ip)
                     unique_ips.add(src_ip)
-                if not is_local_ip(dst_ip):
+                if not ignore_local_ips or not is_local_ip(dst_ip):
                     dst_ips.append(dst_ip)
                     unique_ips.add(dst_ip)
 
@@ -140,6 +153,25 @@ def analyze_single_pcap_file(pcap_path):
                         'file': os.path.basename(pcap_path)  # Добавляем имя файла
                     })
 
+            # Обработка NetBIOS Name Service (NBNS)
+            if 'NBNS' in pkt:
+                if hasattr(pkt.nbns, 'name'):
+                    nbns_query = str(pkt.nbns.name)
+                    nbns_queries.append(nbns_query)
+
+                    # Проверяем на подозрительность
+                    reasons = classify_suspicious_domain(nbns_query)
+                    if reasons:
+                        timestamp = str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown"
+                        suspicious_domains.append({
+                            'domain': nbns_query,
+                            'time': timestamp,
+                            'reasons': reasons,
+                            'src_ip': getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown',
+                            'protocol': 'NBNS',
+                            'file': os.path.basename(pcap_path)
+                        })
+
             # Обработка HTTP (если есть)
             if 'HTTP' in pkt and hasattr(pkt.http, 'request_full_uri'):
                 uri = str(pkt.http.request_full_uri)
@@ -155,6 +187,30 @@ def analyze_single_pcap_file(pcap_path):
                         'file': os.path.basename(pcap_path)
                     })
 
+            # Обработка SMB/NTLM (возможные попытки аутентификации)
+            if 'SMB' in pkt or 'NTLM' in pkt:
+                src_ip = getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown'
+                dst_ip = getattr(pkt.ip, 'dst', 'unknown') if 'IP' in pkt else 'unknown'
+
+                # Попытка извлечь имя пользователя из SMB/NTLM
+                username = 'unknown'
+                if hasattr(pkt, 'smb') and hasattr(pkt.smb, 'ntlmssp_auth_username'):
+                    username = str(pkt.smb.ntlmssp_auth_username)
+                elif hasattr(pkt, 'ntlm') and hasattr(pkt.ntlm, 'username'):
+                    username = str(pkt.ntlm.username)
+
+                if username != 'unknown':
+                    timestamp = str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown"
+                    protocol = 'SMB' if 'SMB' in pkt else 'NTLM'
+                    login_attempts.append({
+                        'src_ip': src_ip,
+                        'dst_ip': dst_ip,
+                        'username': username,
+                        'protocol': protocol,
+                        'time': timestamp,
+                        'file': os.path.basename(pcap_path)
+                    })
+
     except Exception as e:
         print(f"[ERROR] Ошибка при анализе пакета в файле {pcap_path}: {e}")
         return None
@@ -163,16 +219,19 @@ def analyze_single_pcap_file(pcap_path):
         'src_ips': src_ips,
         'dst_ips': dst_ips,
         'dns_queries': dns_queries,
+        'nbns_queries': nbns_queries,
         'unique_ips': unique_ips,
         'suspicious_domains': suspicious_domains,
         'suspicious_ips': suspicious_ips,
         'http_requests': http_requests,
         'domain_count': domain_count,
+        'protocol_stats': protocol_stats,
+        'login_attempts': login_attempts,
         'total_packets': len(list(pyshark.FileCapture(pcap_path, keep_packets=False)))
     }
 
 
-def main(input_path, json_output_path):
+def main(input_path, json_output_path, ignore_local_ips):
     pcap_files = get_pcap_files(input_path)
 
     if not pcap_files:
@@ -180,25 +239,30 @@ def main(input_path, json_output_path):
         return
 
     print(f"[INFO] Найдено {len(pcap_files)} PCAP файлов для анализа")
+    print(f"[INFO] Режим игнорирования локальных IP: {'ВКЛ' if ignore_local_ips else 'ВЫКЛ'}")
     print(f"[INFO] Выходной JSON файл: {json_output_path}")
 
     # Объединяем данные из всех файлов
     all_src_ips = []
     all_dst_ips = []
     all_dns_queries = []
+    all_nbns_queries = []
     all_unique_ips = set()
     all_suspicious_domains = []
     all_suspicious_ips = set()
     all_http_requests = defaultdict(list)
     all_domain_count = Counter()
+    all_protocol_stats = Counter()
+    all_login_attempts = []
     total_packets = 0
 
     for pcap_file in pcap_files:
-        file_data = analyze_single_pcap_file(pcap_file)
+        file_data = analyze_single_pcap_file(pcap_file, ignore_local_ips)
         if file_data:
             all_src_ips.extend(file_data['src_ips'])
             all_dst_ips.extend(file_data['dst_ips'])
             all_dns_queries.extend(file_data['dns_queries'])
+            all_nbns_queries.extend(file_data['nbns_queries'])
             all_unique_ips.update(file_data['unique_ips'])
             all_suspicious_domains.extend(file_data['suspicious_domains'])
             all_suspicious_ips.update(file_data['suspicious_ips'])
@@ -209,6 +273,13 @@ def main(input_path, json_output_path):
 
             # Объединяем счетчики доменов
             all_domain_count.update(file_data['domain_count'])
+
+            # Объединяем статистику протоколов
+            all_protocol_stats.update(file_data['protocol_stats'])
+
+            # Объединяем попытки входа
+            all_login_attempts.extend(file_data['login_attempts'])
+
             total_packets += file_data['total_packets']
 
     # --- Генерация отчёта ---
@@ -219,11 +290,14 @@ def main(input_path, json_output_path):
     report_lines.append("📊 РАСШИРЕННЫЙ АНАЛИЗ .PCAP ФАЙЛОВ")
     report_lines.append("=" * 70)
     report_lines.append(f"📁 Всего обработано файлов: {len(pcap_files)}")
+    report_lines.append(f"🔒 Режим игнорирования локальных IP: {'ВКЛ' if ignore_local_ips else 'ВЫКЛ'}")
     for file_path in pcap_files:
         report_lines.append(f"📄 {file_path}")
     report_lines.append(f"⏱️ Всего пакетов: {total_packets}")
     report_lines.append(f"🌐 Уникальных внешних IP: {len(all_unique_ips)}")
     report_lines.append(f"📡 Всего DNS-запросов: {len(all_dns_queries)}")
+    report_lines.append(f"🏷️ Всего NBNS-запросов: {len(all_nbns_queries)}")
+    report_lines.append(f"🔑 Найдено попыток входа: {len(all_login_attempts)}")
 
     # Топ-5 отправителей и получателей
     src_counter = Counter(all_src_ips)
@@ -240,13 +314,29 @@ def main(input_path, json_output_path):
     for ip, count in top_dst:
         report_lines.append(f"   {ip}: {count} раз")
 
+    # Топ-5 протоколов
+    if all_protocol_stats:
+        top_protocols = all_protocol_stats.most_common(5)
+        report_lines.append("\n🔗 ТОП-5 протоколов:")
+        for protocol, count in top_protocols:
+            report_lines.append(f"   {protocol}: {count} пакетов")
+
+    # Попытки входа
+    if all_login_attempts:
+        report_lines.append(f"\n🔑 Обнаруженные попытки входа:")
+        for attempt in all_login_attempts:
+            report_lines.append(
+                f"   [⏰{attempt['time']}] {attempt['username']}@{attempt['src_ip']} → {attempt['dst_ip']} ({attempt['protocol']}) [файл: {attempt['file']}]")
+
     # Подозрительные домены с временем и причинами
     report_lines.append(f"\n⚠️ Найдено подозрительных доменов: {len(all_suspicious_domains)}")
     if all_suspicious_domains:
         report_lines.append("   Детализация (время, домен, причины):")
         for item in all_suspicious_domains:
             reasons_str = ", ".join(item['reasons'])
-            report_lines.append(f"      [⏰{item['time']}] {item['domain']} → ({reasons_str}) [файл: {item['file']}]")
+            protocol_info = f" ({item.get('protocol', 'DNS')})" if 'protocol' in item else ""
+            report_lines.append(
+                f"      [⏰{item['time']}] {item['domain']}{protocol_info} → ({reasons_str}) [файл: {item['file']}]")
 
     # Часто запрашиваемые домены (подозрительно частые)
     frequent_domains = [d for d, cnt in all_domain_count.most_common(10) if cnt > 5]
@@ -286,19 +376,25 @@ def main(input_path, json_output_path):
             'total_packets': total_packets,
             'unique_external_ips': len(all_unique_ips),
             'total_dns_queries': len(all_dns_queries),
+            'total_nbns_queries': len(all_nbns_queries),
+            'login_attempts_found': len(all_login_attempts),
             'suspicious_domains_found': len(all_suspicious_domains),
             'suspicious_ips_found': len(all_suspicious_ips),
+            'ignore_local_ips': ignore_local_ips,
             'processed_files': pcap_files
         },
         'src_ips': all_src_ips,
         'dst_ips': all_dst_ips,
         'dns_queries': all_dns_queries,
+        'nbns_queries': all_nbns_queries,
         'unique_ips': list(all_unique_ips),
         'suspicious_domains': all_suspicious_domains,
         'suspicious_ips': list(all_suspicious_ips),
         'http_requests': {domain: [{'uri': req['uri'], 'time': req['time'], 'file': req['file']} for req in requests]
                           for domain, requests in all_http_requests.items()},
-        'domain_count': dict(all_domain_count)
+        'domain_count': dict(all_domain_count),
+        'protocol_stats': dict(all_protocol_stats),
+        'login_attempts': all_login_attempts
     }
 
     # Сохранение детальных событий в JSON по указанному пути
@@ -307,14 +403,35 @@ def main(input_path, json_output_path):
     print(f"✅ Детальные события сохранены в: {json_output_path}")
 
 
+def parse_arguments():
+    """Парсит аргументы командной строки"""
+    args = []
+    flags = []
+
+    for arg in sys.argv[1:]:
+        if arg.startswith('-'):
+            flags.append(arg.lstrip('-'))
+        else:
+            args.append(arg)
+
+    return args, flags
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Использование: python analyze_pcap_enhanced.py <путь_к_.pcap_или_папке> <путь_к_.json>")
+    args, flags = parse_arguments()
+
+    if len(args) != 2:
+        print("Использование: python analyze_pcap_enhanced.py [-l] <путь_к_.pcap_или_папке> <путь_к_.json>")
+        print("Флаги:")
+        print("  -l : игнорировать локальные IP-адреса")
         print("Примеры:")
         print("  python analyze_pcap_enhanced.py capture.pcap output.json")
+        print("  python analyze_pcap_enhanced.py -l capture.pcap output.json")
         print("  python analyze_pcap_enhanced.py /path/to/pcap/files/ output.json")
         sys.exit(1)
 
-    input_path = sys.argv[1]
-    json_output_file = sys.argv[2]
-    main(input_path, json_output_file)
+    input_path = args[0]
+    json_output_file = args[1]
+    ignore_local_ips = 'l' in flags
+
+    main(input_path, json_output_file, ignore_local_ips)
