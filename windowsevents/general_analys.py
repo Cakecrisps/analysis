@@ -78,18 +78,6 @@ def parse_xml_string(xml_string):
             return None
 
 
-def extract_field_value(element, field_name):
-    """Извлекает значение поля из XML элемента"""
-    try:
-        # Пытаемся найти поле различными способами
-        elements = element.findall(f".//{field_name}") or element.findall(f".//*[@Name='{field_name}']")
-        if elements:
-            return elements[0].text or elements[0].attrib.get('Value', '')
-        return ''
-    except:
-        return ''
-
-
 def extract_event_data(record_xml):
     """Извлекает данные из XML записи события"""
     root = parse_xml_string(record_xml)
@@ -98,20 +86,22 @@ def extract_event_data(record_xml):
 
     event_data = {}
 
+    # Пробуем найти с namespace
+    ns = {'e': 'http://schemas.microsoft.com/win/2004/08/events/event'}
+
     # Ищем EventData или UserData
-    event_data_elem = root.find('.//EventData') or root.find('.//UserData')
+    event_data_elem = root.find('.//e:EventData', ns) or root.find('.//e:UserData', ns)
     if event_data_elem is not None:
-        # Извлекаем все элементы внутри EventData
         for elem in event_data_elem:
-            name = elem.get('Name') or elem.tag
+            name = elem.get('Name') or elem.tag.split('}')[-1]  # Убираем namespace
             event_data[name] = elem.text or elem.attrib.get('Value', '')
 
-    # Также ищем в System
-    system_elem = root.find('.//System')
+    # Ищем System
+    system_elem = root.find('.//e:System', ns)
     if system_elem is not None:
         for elem in system_elem:
-            name = elem.tag
-            event_data[f"System_{name}"] = elem.text or elem.attrib.get('Value', '')
+            tag = elem.tag.split('}')[-1]
+            event_data[f"System_{tag}"] = elem.text or elem.attrib.get('Value', '')
 
     return event_data
 
@@ -137,8 +127,8 @@ def analyze_single_evtx_file(evtx_path):
     print(f"[INFO] Анализируем файл: {evtx_path}")
 
     # Структуры данных
-    login_attempts = []  # [(username, ip, time, event_id)]
-    failed_logins = []  # [(username, ip, time, reason)]
+    login_attempts = []  # [(username, ip, time, event_id, port, domain, file)]
+    failed_logins = []  # [(username, ip, time, reason, domain, file)]
     powershell_commands = []  # [(command, time, user, reasons)]
     process_creations = []  # [(process, user, time, command_line)]
     network_connections = []  # [(process, local_ip, remote_ip, time)]
@@ -146,10 +136,14 @@ def analyze_single_evtx_file(evtx_path):
 
     try:
         with Evtx(evtx_path) as log:
-            for record in log.records():
+            for i, record in enumerate(log.records()):
                 try:
                     # Получаем XML содержимое записи
-                    record_xml = extract_xml_from_evtx_record(record.xml())
+                    raw_xml = record.xml()
+                    if not raw_xml.strip():
+                        continue
+
+                    record_xml = extract_xml_from_evtx_record(raw_xml)
 
                     # Извлекаем данные события
                     event_data = extract_event_data(record_xml)
@@ -168,19 +162,21 @@ def analyze_single_evtx_file(evtx_path):
                         username = event_data.get('TargetUserName', '')
                         domain = event_data.get('TargetDomainName', '')
                         ip_address = event_data.get('IpAddress', '')
+                        port = event_data.get('IpPort', 'N/A')
 
-                        # Если IP не найден в IpAddress, пробуем IpPort
+                        # Если IP не найден в IpAddress, пробуем WorkstationName
                         if not ip_address or ip_address == '-':
-                            ip_address = event_data.get('WorkstationName', '')
+                            ip_address = event_data.get('WorkstationName', 'N/A')
 
                         if username and ip_address and ip_address != '-':
                             login_info = {
                                 'username': username,
                                 'domain': domain,
                                 'ip': ip_address,
+                                'port': port,
                                 'time': timestamp,
                                 'event_id': event_id,
-                                'file': os.path.basename(evtx_path)  # Добавляем имя файла
+                                'file': os.path.basename(evtx_path)
                             }
 
                             if event_id == '4624':  # Успешный вход
@@ -191,6 +187,22 @@ def analyze_single_evtx_file(evtx_path):
                                 failed_logins.append(login_info)
                             elif event_id == '4648':  # Попытка входа с явными учетными данными
                                 login_attempts.append(login_info)
+
+                    # --- Анализ событий NetLogon (4776) ---
+                    elif event_id == '4776':
+                        username = event_data.get('TargetUserName', '')
+                        workstation = event_data.get('Workstation', 'N/A')
+                        if username:
+                            login_info = {
+                                'username': username,
+                                'domain': event_data.get('TargetDomainName', 'N/A'),
+                                'ip': workstation,
+                                'port': 'N/A',
+                                'time': timestamp,
+                                'event_id': event_id,
+                                'file': os.path.basename(evtx_path)
+                            }
+                            login_attempts.append(login_info)
 
                     # --- Анализ PowerShell событий (4103, 4104) ---
                     elif event_id in ['4103', '4104']:
@@ -246,6 +258,7 @@ def analyze_single_evtx_file(evtx_path):
                     elif event_id == '5156':  # Filtered packet event
                         local_ip = event_data.get('LocalAddr', '')
                         remote_ip = event_data.get('RemoteAddr', '')
+                        remote_port = event_data.get('RemotePort', 'N/A')
                         process = event_data.get('Application', '')
 
                         if remote_ip and remote_ip not in ['127.0.0.1', '::1']:
@@ -253,6 +266,7 @@ def analyze_single_evtx_file(evtx_path):
                                 'process': process,
                                 'local_ip': local_ip,
                                 'remote_ip': remote_ip,
+                                'remote_port': remote_port,
                                 'time': timestamp,
                                 'file': os.path.basename(evtx_path)
                             }
@@ -268,7 +282,7 @@ def analyze_single_evtx_file(evtx_path):
                                 })
 
                 except Exception as e:
-                    print(f"[WARNING] Ошибка при обработке записи в файле {evtx_path}: {e}")
+                    # print(f"[WARNING] Ошибка при обработке записи {i} в файле {evtx_path}: {e}")
                     continue
 
     except Exception as e:
@@ -329,6 +343,22 @@ def main(input_path, json_output_path):
     report_lines.append(f"⚙️ Найдено созданий процессов: {len(all_process_creations)}")
     report_lines.append(f"🌐 Найдено сетевых подключений: {len(all_network_connections)}")
 
+    # Все логины построчно
+    if all_login_attempts:
+        report_lines.append(f"\n📋 Все успешные входы:")
+        for login in all_login_attempts:
+            report_lines.append(
+                f"   [⏰{login['time']}] [IP: {login['ip']}:{login['port']}] [User: {login['username']}@{login['domain']}] "
+                f"[EventID: {login['event_id']}] [File: {login['file']}]")
+
+    # Все неудачные попытки построчно
+    if all_failed_logins:
+        report_lines.append(f"\n❌ Все неудачные попытки входа:")
+        for login in all_failed_logins:
+            report_lines.append(
+                f"   [⏰{login['time']}] [IP: {login['ip']}] [User: {login['username']}@{login['domain']}] "
+                f"[Reason: {login['failure_reason']}] [EventID: {login['event_id']}] [File: {login['file']}]")
+
     # Топ-5 IP с которых пытались войти
     ip_login_counter = Counter()
     for login in all_login_attempts:
@@ -367,12 +397,6 @@ def main(input_path, json_output_path):
                 report_lines.append(f"      • {ip} ({count} подключений)")
             report_lines.append("")  # Пустая строка для разделения
 
-    # Неудачные попытки входа
-    if all_failed_logins:
-        report_lines.append(f"\n❌ Неудачные попытки входа (топ-10):")
-        for login in all_failed_logins[:10]:
-            report_lines.append(f"   [⏰{login['time']}] {login['username']}@{login['ip']} - {login['failure_reason']}")
-
     # Подозрительные PowerShell команды
     if all_powershell_commands:
         report_lines.append(f"\n⚠️ Подозрительные PowerShell команды:")
@@ -399,7 +423,7 @@ def main(input_path, json_output_path):
             report_lines.append(f"\n📡 Подозрительные сетевые подключения:")
             for conn in suspicious_connections:
                 report_lines.append(
-                    f"   [⏰{conn['time']}] {conn['process']} подключился к {conn['remote_ip']} [файл: {conn['file']}]")
+                    f"   [⏰{conn['time']}] {conn['process']} подключился к {conn['remote_ip']}:{conn['remote_port']} [файл: {conn['file']}]")
 
     # Общие подозрительные события
     if all_suspicious_events:
