@@ -127,10 +127,10 @@ def analyze_single_evtx_file(evtx_path):
     print(f"[INFO] Анализируем файл: {evtx_path}")
 
     # Структуры данных
-    login_attempts = []  # [(username, ip, time, event_id, port, domain, file)]
-    failed_logins = []  # [(username, ip, time, reason, domain, file)]
+    login_attempts = []  # [(username, ip, time, event_id, port, domain, logon_id, file)]
+    failed_logins = []  # [(username, ip, time, reason, domain, logon_id, file)]
     powershell_commands = []  # [(command, time, user, reasons)]
-    process_creations = []  # [(process, user, time, command_line)]
+    process_creations = []  # [(process, user, time, command_line, logon_id)]
     network_connections = []  # [(process, local_ip, remote_ip, time)]
     suspicious_events = []  # [(event_id, time, description)]
 
@@ -163,6 +163,7 @@ def analyze_single_evtx_file(evtx_path):
                         domain = event_data.get('TargetDomainName', '')
                         ip_address = event_data.get('IpAddress', '')
                         port = event_data.get('IpPort', 'N/A')
+                        logon_id = event_data.get('TargetLogonId', 'N/A')
 
                         # Если IP не найден в IpAddress, пробуем WorkstationName
                         if not ip_address or ip_address == '-':
@@ -174,6 +175,7 @@ def analyze_single_evtx_file(evtx_path):
                                 'domain': domain,
                                 'ip': ip_address,
                                 'port': port,
+                                'logon_id': logon_id,
                                 'time': timestamp,
                                 'event_id': event_id,
                                 'file': os.path.basename(evtx_path)
@@ -192,12 +194,14 @@ def analyze_single_evtx_file(evtx_path):
                     elif event_id == '4776':
                         username = event_data.get('TargetUserName', '')
                         workstation = event_data.get('Workstation', 'N/A')
+                        logon_id = event_data.get('TargetLogonId', 'N/A')
                         if username:
                             login_info = {
                                 'username': username,
                                 'domain': event_data.get('TargetDomainName', 'N/A'),
                                 'ip': workstation,
                                 'port': 'N/A',
+                                'logon_id': logon_id,
                                 'time': timestamp,
                                 'event_id': event_id,
                                 'file': os.path.basename(evtx_path)
@@ -208,6 +212,7 @@ def analyze_single_evtx_file(evtx_path):
                     elif event_id in ['4103', '4104']:
                         user = event_data.get('SubjectUserName', '')
                         command_line = event_data.get('Payload', '')
+                        logon_id = event_data.get('SubjectLogonId', 'N/A')
 
                         if command_line:
                             reasons = classify_suspicious_powershell_command(command_line)
@@ -216,6 +221,7 @@ def analyze_single_evtx_file(evtx_path):
                                     'command': command_line,
                                     'time': timestamp,
                                     'user': user,
+                                    'logon_id': logon_id,
                                     'reasons': reasons,
                                     'file': os.path.basename(evtx_path)
                                 }
@@ -232,6 +238,7 @@ def analyze_single_evtx_file(evtx_path):
                         process_name = event_data.get('NewProcessName', '')
                         user = event_data.get('SubjectUserName', '')
                         command_line = event_data.get('CommandLine', '')
+                        logon_id = event_data.get('SubjectLogonId', 'N/A')
 
                         if process_name:
                             process_info = {
@@ -239,6 +246,7 @@ def analyze_single_evtx_file(evtx_path):
                                 'user': user,
                                 'time': timestamp,
                                 'command_line': command_line,
+                                'logon_id': logon_id,
                                 'file': os.path.basename(evtx_path)
                             }
                             process_creations.append(process_info)
@@ -349,7 +357,7 @@ def main(input_path, json_output_path):
         for login in all_login_attempts:
             report_lines.append(
                 f"   [⏰{login['time']}] [IP: {login['ip']}:{login['port']}] [User: {login['username']}@{login['domain']}] "
-                f"[EventID: {login['event_id']}] [File: {login['file']}]")
+                f"[LogonID: {login['logon_id']}] [EventID: {login['event_id']}] [File: {login['file']}]")
 
     # Все неудачные попытки построчно
     if all_failed_logins:
@@ -357,7 +365,7 @@ def main(input_path, json_output_path):
         for login in all_failed_logins:
             report_lines.append(
                 f"   [⏰{login['time']}] [IP: {login['ip']}] [User: {login['username']}@{login['domain']}] "
-                f"[Reason: {login['failure_reason']}] [EventID: {login['event_id']}] [File: {login['file']}]")
+                f"[LogonID: {login['logon_id']}] [Reason: {login['failure_reason']}] [EventID: {login['event_id']}] [File: {login['file']}]")
 
     # Топ-5 IP с которых пытались войти
     ip_login_counter = Counter()
@@ -403,7 +411,7 @@ def main(input_path, json_output_path):
         for cmd in all_powershell_commands:
             reasons_str = ", ".join(cmd['reasons']) if cmd['reasons'] else "длинная_команда"
             report_lines.append(
-                f"   [⏰{cmd['time']}] {cmd['user']}: {cmd['command'][:100]}... ({reasons_str}) [файл: {cmd['file']}]")
+                f"   [⏰{cmd['time']}] {cmd['user']} [LogonID: {cmd['logon_id']}] : {cmd['command'][:100]}... ({reasons_str}) [файл: {cmd['file']}]")
 
     # Подозрительные процессы
     if all_process_creations:
@@ -414,7 +422,7 @@ def main(input_path, json_output_path):
             report_lines.append(f"\n🚨 Подозрительные процессы:")
             for proc in suspicious_processes[:10]:
                 report_lines.append(
-                    f"   [⏰{proc['time']}] {proc['user']} запустил {proc['process']} с командой: {proc['command_line']} [файл: {proc['file']}]")
+                    f"   [⏰{proc['time']}] {proc['user']} [LogonID: {proc['logon_id']}] запустил {proc['process']} с командой: {proc['command_line']} [файл: {proc['file']}]")
 
     # Подозрительные сетевые подключения
     if all_network_connections:
