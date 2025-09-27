@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# analyze_evtx_enhanced.py
+# general_scan.py
 import sys
 import os
 import json
