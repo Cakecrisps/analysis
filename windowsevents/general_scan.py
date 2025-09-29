@@ -9,6 +9,7 @@ from datetime import datetime
 from Evtx.Evtx import Evtx
 from Evtx.Views import evtx_file_xml_view
 import xml.etree.ElementTree as ET
+import json as json_lib  # чтобы не перепутать с json.dump
 
 # --- Конфигурация ---
 SUSPICIOUS_IPS = {
@@ -103,6 +104,15 @@ def extract_event_data(record_xml):
             tag = elem.tag.split('}')[-1]
             event_data[f"System_{tag}"] = elem.text or elem.attrib.get('Value', '')
 
+    # --- Дополнительно: обработка UserData с EventXML (например, EventID 1149) ---
+    user_data_elem = root.find('.//e:UserData', ns)
+    if user_data_elem is not None:
+        event_xml = user_data_elem.find('.//{Event_NS}EventXML')
+        if event_xml is not None:
+            for param in event_xml:
+                param_name = param.tag.split('}')[-1]  # Убираем namespace
+                event_data[param_name] = param.text or ''
+
     return event_data
 
 
@@ -129,9 +139,17 @@ def analyze_single_evtx_file(evtx_path):
     # Структуры данных
     login_attempts = []  # [(username, ip, time, event_id, port, domain, logon_id, file)]
     failed_logins = []  # [(username, ip, time, reason, domain, logon_id, file)]
+    rdp_sessions = []  # [(username, ip, time, event_id, session_id, file)]
+    smb_accesses = []  # [(user, file_path, access_mask, time, event_id, file)]
+    file_actions = []  # [(user, file_path, action, time, event_id, file)]
+    file_downloads = []  # [(user, file_path, size, time, event_id, file)]
+    log_clearing_events = []  # [(user, channel, time, event_id, file)]
+    unhandled_events = []  # [{"xml": raw_xml, "event_id": event_id, "file": filename}]
     powershell_commands = []  # [(command, time, user, reasons)]
     process_creations = []  # [(process, user, time, command_line, logon_id)]
     network_connections = []  # [(process, local_ip, remote_ip, time)]
+    winrm_accesses = []  # [(user, time, event_id, file)]
+    wmi_queries = []  # [(user, query, time, event_id, file)]
     suspicious_events = []  # [(event_id, time, description)]
 
     try:
@@ -157,137 +175,120 @@ def analyze_single_evtx_file(evtx_path):
                     event_id = event_data.get('EventID', event_data.get('System_EventID', ''))
                     event_id = str(event_id)
 
-                    # --- Анализ событий входа в систему (4624, 4625, 4648) ---
-                    if event_id in ['4624', '4625', '4648']:
-                        username = event_data.get('TargetUserName', '')
-                        domain = event_data.get('TargetDomainName', '')
-                        ip_address = event_data.get('IpAddress', '')
-                        port = event_data.get('IpPort', 'N/A')
-                        logon_id = event_data.get('TargetLogonId', 'N/A')
+                    # --- События, которые мы **пытаемся обработать**, но **XML не соответствует** ---
+                    # Список ID, которые мы обрабатываем
+                    handled_event_ids = {
+                        '1102', '104', '108', '1104',  # очистка логов
+                        '1003',  # SmartScreen
+                        '1149', '21', '22', '23', '24', '25',  # RDP
+                        '4624', '4625', '4648', '4776',  # входы
+                        '4656', '4663', '5140', '5145',  # SMB
+                        '4658', '4660', '4670', '4674',  # файлы
+                        '4194', '4195', '4197', '4198',  # WinRM
+                        '5857', '5858', '5861', '5862',  # WMI
+                        '4103', '4104',  # PowerShell
+                        '4688',  # процессы
+                        '5156'  # сеть
+                    }
 
-                        # Если IP не найден в IpAddress, пробуем WorkstationName
-                        if not ip_address or ip_address == '-':
-                            ip_address = event_data.get('WorkstationName', 'N/A')
+                    # --- События очистки логов: 1102, 104, 108, 1104 ---
+                    if event_id in ['1102', '104', '108', '1104']:
+                        # Извлекаем имя пользователя, канал и т.д.
+                        user = event_data.get('SubjectUserName', 'N/A')
+                        channel = event_data.get('Channel', 'N/A') or event_data.get('System_Channel', 'N/A')
 
-                        if username and ip_address and ip_address != '-':
-                            login_info = {
-                                'username': username,
-                                'domain': domain,
-                                'ip': ip_address,
-                                'port': port,
-                                'logon_id': logon_id,
-                                'time': timestamp,
+                        log_event_info = {
+                            'user': user,
+                            'channel': channel,
+                            'time': timestamp,
+                            'event_id': event_id,
+                            'file': os.path.basename(evtx_path)
+                        }
+                        log_clearing_events.append(log_event_info)
+
+                    # --- SmartScreen: EventID 1003 (файлы, проверенные SmartScreen) ---
+                    elif event_id == '1003':
+                        # В Data содержится JSON-строка
+                        data_str = event_data.get('Data', '')
+                        if data_str:
+                            try:
+                                smart_data = json_lib.loads(data_str)
+                                path = smart_data.get('path', 'N/A')
+                                size = smart_data.get('size', 'N/A')
+                                execution_time = smart_data.get('executionTime', 'N/A')
+                                event_type = smart_data.get('$type', 'N/A')
+
+                                if path != 'N/A':
+                                    file_download_info = {
+                                        'user': 'N/A',  # SmartScreen не указывает пользователя напрямую
+                                        'file_path': path,
+                                        'size': size,
+                                        'execution_time': execution_time,
+                                        'type': event_type,
+                                        'time': timestamp,
+                                        'event_id': event_id,
+                                        'file': os.path.basename(evtx_path)
+                                    }
+                                    file_downloads.append(file_download_info)
+                                else:
+                                    # XML не соответствует ожидаемому формату
+                                    unhandled_events.append({
+                                        'xml': raw_xml,
+                                        'event_id': event_id,
+                                        'file': os.path.basename(evtx_path)
+                                    })
+                            except json_lib.JSONDecodeError:
+                                # JSON в Data не распознан — сохраняем XML
+                                unhandled_events.append({
+                                    'xml': raw_xml,
+                                    'event_id': event_id,
+                                    'file': os.path.basename(evtx_path)
+                                })
+                        else:
+                            # Data пустое — сохраняем XML
+                            unhandled_events.append({
+                                'xml': raw_xml,
                                 'event_id': event_id,
                                 'file': os.path.basename(evtx_path)
-                            }
+                            })
 
-                            if event_id == '4624':  # Успешный вход
-                                login_attempts.append(login_info)
-                            elif event_id == '4625':  # Неудачная попытка
-                                failure_reason = event_data.get('Status', 'Unknown')
-                                login_info['failure_reason'] = failure_reason
-                                failed_logins.append(login_info)
-                            elif event_id == '4648':  # Попытка входа с явными учетными данными
-                                login_attempts.append(login_info)
+                    # --- RDP: EventID 1149 ---
+                    elif event_id == '1149':
+                        username = event_data.get('Param1', '')
+                        ip_address = event_data.get('Param3', 'N/A')
+                        session_id = 'N/A'
 
-                    # --- Анализ событий NetLogon (4776) ---
-                    elif event_id == '4776':
-                        username = event_data.get('TargetUserName', '')
-                        workstation = event_data.get('Workstation', 'N/A')
-                        logon_id = event_data.get('TargetLogonId', 'N/A')
                         if username:
-                            login_info = {
+                            rdp_info = {
                                 'username': username,
-                                'domain': event_data.get('TargetDomainName', 'N/A'),
-                                'ip': workstation,
-                                'port': 'N/A',
-                                'logon_id': logon_id,
+                                'ip': ip_address,
+                                'session_id': session_id,
                                 'time': timestamp,
                                 'event_id': event_id,
                                 'file': os.path.basename(evtx_path)
                             }
-                            login_attempts.append(login_info)
-
-                    # --- Анализ PowerShell событий (4103, 4104) ---
-                    elif event_id in ['4103', '4104']:
-                        user = event_data.get('SubjectUserName', '')
-                        command_line = event_data.get('Payload', '')
-                        logon_id = event_data.get('SubjectLogonId', 'N/A')
-
-                        if command_line:
-                            reasons = classify_suspicious_powershell_command(command_line)
-                            if reasons or len(command_line) > 100:  # Длинные команды тоже подозрительны
-                                powershell_info = {
-                                    'command': command_line,
-                                    'time': timestamp,
-                                    'user': user,
-                                    'logon_id': logon_id,
-                                    'reasons': reasons,
-                                    'file': os.path.basename(evtx_path)
-                                }
-                                powershell_commands.append(powershell_info)
-                                suspicious_events.append({
-                                    'event_id': event_id,
-                                    'time': timestamp,
-                                    'description': f"Подозрительная PowerShell команда: {command_line[:100]}...",
-                                    'file': os.path.basename(evtx_path)
-                                })
-
-                    # --- Анализ создания процессов (4688) ---
-                    elif event_id == '4688':
-                        process_name = event_data.get('NewProcessName', '')
-                        user = event_data.get('SubjectUserName', '')
-                        command_line = event_data.get('CommandLine', '')
-                        logon_id = event_data.get('SubjectLogonId', 'N/A')
-
-                        if process_name:
-                            process_info = {
-                                'process': process_name,
-                                'user': user,
-                                'time': timestamp,
-                                'command_line': command_line,
-                                'logon_id': logon_id,
+                            rdp_sessions.append(rdp_info)
+                        else:
+                            # XML не соответствует ожидаемому формату
+                            unhandled_events.append({
+                                'xml': raw_xml,
+                                'event_id': event_id,
                                 'file': os.path.basename(evtx_path)
-                            }
-                            process_creations.append(process_info)
+                            })
 
-                            # Проверяем подозрительные процессы
-                            suspicious_processes = ['powershell', 'cmd', 'net', 'netsh', 'certutil', 'bitsadmin',
-                                                    'psexec', 'wmic']
-                            if any(proc in process_name.lower() for proc in suspicious_processes):
-                                suspicious_events.append({
-                                    'event_id': event_id,
-                                    'time': timestamp,
-                                    'description': f"Подозрительный процесс: {process_name} с командой: {command_line}",
-                                    'file': os.path.basename(evtx_path)
-                                })
-
-                    # --- Анализ сетевых подключений (если есть) ---
-                    elif event_id == '5156':  # Filtered packet event
-                        local_ip = event_data.get('LocalAddr', '')
-                        remote_ip = event_data.get('RemoteAddr', '')
-                        remote_port = event_data.get('RemotePort', 'N/A')
-                        process = event_data.get('Application', '')
-
-                        if remote_ip and remote_ip not in ['127.0.0.1', '::1']:
-                            network_info = {
-                                'process': process,
-                                'local_ip': local_ip,
-                                'remote_ip': remote_ip,
-                                'remote_port': remote_port,
-                                'time': timestamp,
+                    # --- Все остальные события ---
+                    elif event_id in handled_event_ids:
+                        # Проверяем, были ли извлечены какие-либо поля
+                        if not event_data:
+                            # XML не соответствует ожидаемому формату
+                            unhandled_events.append({
+                                'xml': raw_xml,
+                                'event_id': event_id,
                                 'file': os.path.basename(evtx_path)
-                            }
-                            network_connections.append(network_info)
+                            })
 
-                            # Проверяем подозрительные IP
-                            if remote_ip in SUSPICIOUS_IPS:
-                                suspicious_events.append({
-                                    'event_id': event_id,
-                                    'time': timestamp,
-                                    'description': f"Подключение к подозрительному IP: {remote_ip}",
-                                    'file': os.path.basename(evtx_path)
-                                })
+                    # --- Остальные события (не обрабатываемые) ---
+                    # Пропускаем их, если не входят в `handled_event_ids`
 
                 except Exception as e:
                     # print(f"[WARNING] Ошибка при обработке записи {i} в файле {evtx_path}: {e}")
@@ -300,9 +301,17 @@ def analyze_single_evtx_file(evtx_path):
     return {
         'login_attempts': login_attempts,
         'failed_logins': failed_logins,
+        'rdp_sessions': rdp_sessions,
+        'smb_accesses': smb_accesses,
+        'file_actions': file_actions,
+        'file_downloads': file_downloads,
+        'log_clearing_events': log_clearing_events,
+        'unhandled_events': unhandled_events,
         'powershell_commands': powershell_commands,
         'process_creations': process_creations,
         'network_connections': network_connections,
+        'winrm_accesses': winrm_accesses,
+        'wmi_queries': wmi_queries,
         'suspicious_events': suspicious_events
     }
 
@@ -320,9 +329,17 @@ def main(input_path, json_output_path):
     # Объединяем данные из всех файлов
     all_login_attempts = []
     all_failed_logins = []
+    all_rdp_sessions = []
+    all_smb_accesses = []
+    all_file_actions = []
+    all_file_downloads = []
+    all_log_clearing_events = []
+    all_unhandled_events = []
     all_powershell_commands = []
     all_process_creations = []
     all_network_connections = []
+    all_winrm_accesses = []
+    all_wmi_queries = []
     all_suspicious_events = []
 
     for evtx_file in evtx_files:
@@ -330,9 +347,17 @@ def main(input_path, json_output_path):
         if file_data:
             all_login_attempts.extend(file_data['login_attempts'])
             all_failed_logins.extend(file_data['failed_logins'])
+            all_rdp_sessions.extend(file_data['rdp_sessions'])
+            all_smb_accesses.extend(file_data['smb_accesses'])
+            all_file_actions.extend(file_data['file_actions'])
+            all_file_downloads.extend(file_data['file_downloads'])
+            all_log_clearing_events.extend(file_data['log_clearing_events'])
+            all_unhandled_events.extend(file_data['unhandled_events'])
             all_powershell_commands.extend(file_data['powershell_commands'])
             all_process_creations.extend(file_data['process_creations'])
             all_network_connections.extend(file_data['network_connections'])
+            all_winrm_accesses.extend(file_data['winrm_accesses'])
+            all_wmi_queries.extend(file_data['wmi_queries'])
             all_suspicious_events.extend(file_data['suspicious_events'])
 
     # --- Генерация отчёта ---
@@ -347,9 +372,17 @@ def main(input_path, json_output_path):
         report_lines.append(f"📄 {file_path}")
     report_lines.append(f"🌐 Найдено успешных входов: {len(all_login_attempts)}")
     report_lines.append(f"❌ Найдено неудачных входов: {len(all_failed_logins)}")
+    report_lines.append(f"🖥️ Найдено RDP-сессий: {len(all_rdp_sessions)}")
+    report_lines.append(f"📁 Найдено SMB-доступов: {len(all_smb_accesses)}")
+    report_lines.append(f"📄 Найдено файловых действий: {len(all_file_actions)}")
+    report_lines.append(f"📥 Найдено загрузок (SmartScreen): {len(all_file_downloads)}")
+    report_lines.append(f"🗑️ Найдено очисток логов: {len(all_log_clearing_events)}")
     report_lines.append(f"🔧 Найдено PowerShell команд: {len(all_powershell_commands)}")
     report_lines.append(f"⚙️ Найдено созданий процессов: {len(all_process_creations)}")
     report_lines.append(f"🌐 Найдено сетевых подключений: {len(all_network_connections)}")
+    report_lines.append(f"📡 Найдено WinRM-доступов: {len(all_winrm_accesses)}")
+    report_lines.append(f"🔍 Найдено WMI-запросов: {len(all_wmi_queries)}")
+    report_lines.append(f"⚠️ Найдено необработанных событий: {len(all_unhandled_events)}")
 
     # Все логины построчно
     if all_login_attempts:
@@ -358,6 +391,67 @@ def main(input_path, json_output_path):
             report_lines.append(
                 f"   [⏰{login['time']}] [IP: {login['ip']}:{login['port']}] [User: {login['username']}@{login['domain']}] "
                 f"[LogonID: {login['logon_id']}] [EventID: {login['event_id']}] [File: {login['file']}]")
+
+    # Все RDP-сессии
+    if all_rdp_sessions:
+        report_lines.append(f"\n🖥️ Все RDP-сессии:")
+        for rdp in all_rdp_sessions:
+            report_lines.append(
+                f"   [⏰{rdp['time']}] [User: {rdp['username']}] [IP: {rdp['ip']}] [SessionID: {rdp['session_id']}] "
+                f"[EventID: {rdp['event_id']}] [File: {rdp['file']}]")
+
+    # Все SMB-доступы
+    if all_smb_accesses:
+        report_lines.append(f"\n📁 Все SMB-доступы:")
+        for smb in all_smb_accesses:
+            report_lines.append(
+                f"   [⏰{smb['time']}] [User: {smb['user']}] [File: {smb['file_path']}] [IP: {smb['ip']}] [Access: {smb['access_mask']}] "
+                f"[EventID: {smb['event_id']}] [File: {smb['file']}]")
+
+    # Все файловые действия
+    if all_file_actions:
+        report_lines.append(f"\n📄 Все файловые действия:")
+        for f in all_file_actions:
+            report_lines.append(
+                f"   [⏰{f['time']}] [User: {f['user']}] [File: {f['file_path']}] [Action: {f['action']}] [Access: {f['access']}] "
+                f"[EventID: {f['event_id']}] [File: {f['file']}]")
+
+    # Все загрузки (SmartScreen)
+    if all_file_downloads:
+        report_lines.append(f"\n📥 Все загрузки (SmartScreen):")
+        for f in all_file_downloads:
+            report_lines.append(
+                f"   [⏰{f['time']}] [File: {f['file_path']}] [Size: {f['size']}] [Type: {f['type']}] "
+                f"[EventID: {f['event_id']}] [File: {f['file']}]")
+
+    # Все очистки логов
+    if all_log_clearing_events:
+        report_lines.append(f"\n🗑️ Все очистки логов:")
+        for log_event in all_log_clearing_events:
+            report_lines.append(
+                f"   [⏰{log_event['time']}] [User: {log_event['user']}] [Channel: {log_event['channel']}] "
+                f"[EventID: {log_event['event_id']}] [File: {log_event['file']}]")
+
+    # Все необработанные события
+    if all_unhandled_events:
+        report_lines.append(f"\n⚠️ Необработанные события (XML):")
+        for unhandled in all_unhandled_events[:10]:  # Показываем первые 10
+            report_lines.append(
+                f"   [EventID: {unhandled['event_id']}] [File: {unhandled['file']}]")
+
+    # Все WinRM-доступы
+    if all_winrm_accesses:
+        report_lines.append(f"\n📡 Все WinRM-доступы:")
+        for winrm in all_winrm_accesses:
+            report_lines.append(
+                f"   [⏰{winrm['time']}] [User: {winrm['user']}] [EventID: {winrm['event_id']}] [File: {winrm['file']}]")
+
+    # Все WMI-запросы
+    if all_wmi_queries:
+        report_lines.append(f"\n🔍 Все WMI-запросы:")
+        for wmi in all_wmi_queries:
+            report_lines.append(
+                f"   [⏰{wmi['time']}] [User: {wmi['user']}] [Query: {wmi['query']}] [EventID: {wmi['event_id']}] [File: {wmi['file']}]")
 
     # Все неудачные попытки построчно
     if all_failed_logins:
@@ -452,17 +546,33 @@ def main(input_path, json_output_path):
             'total_files_processed': len(evtx_files),
             'total_logins': len(all_login_attempts),
             'failed_logins': len(all_failed_logins),
+            'rdp_sessions_found': len(all_rdp_sessions),
+            'smb_accesses_found': len(all_smb_accesses),
+            'file_actions_found': len(all_file_actions),
+            'file_downloads_found': len(all_file_downloads),
+            'log_clearing_events_found': len(all_log_clearing_events),
+            'unhandled_events_found': len(all_unhandled_events),
             'powershell_commands': len(all_powershell_commands),
             'process_creations': len(all_process_creations),
             'network_connections': len(all_network_connections),
+            'winrm_accesses_found': len(all_winrm_accesses),
+            'wmi_queries_found': len(all_wmi_queries),
             'suspicious_events': len(all_suspicious_events),
             'processed_files': evtx_files
         },
         'login_attempts': all_login_attempts,
         'failed_logins': all_failed_logins,
+        'rdp_sessions': all_rdp_sessions,
+        'smb_accesses': all_smb_accesses,
+        'file_actions': all_file_actions,
+        'file_downloads': all_file_downloads,
+        'log_clearing_events': all_log_clearing_events,
+        'unhandled_events': all_unhandled_events,
         'powershell_commands': all_powershell_commands,
         'process_creations': all_process_creations,
         'network_connections': all_network_connections,
+        'winrm_accesses': all_winrm_accesses,
+        'wmi_queries': all_wmi_queries,
         'suspicious_events': all_suspicious_events
     }
 
@@ -481,10 +591,10 @@ def main(input_path, json_output_path):
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Использование: python analyze_evtx_enhanced.py <путь_к_.evtx_или_папке> <путь_к_.json>")
+        print("Использование: python general_scan.py <путь_к_.evtx_или_папке> <путь_к_.json>")
         print("Примеры:")
-        print("  python analyze_evtx_enhanced.py Security.evtx output.json")
-        print("  python analyze_evtx_enhanced.py /path/to/evtx/files/ output.json")
+        print("  python general_scan.py Security.evtx output.json")
+        print("  python general_scan.py /path/to/evtx/files/ output.json")
         sys.exit(1)
 
     input_path = sys.argv[1]
