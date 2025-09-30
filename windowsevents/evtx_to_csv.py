@@ -109,6 +109,7 @@ def main(input_path, csv_output_path):
         'AccessMask',
         'Status',
         'Message',
+        'LogonID',  # Новый столбец
         'RawXML',
         'File'
     ]
@@ -154,6 +155,11 @@ def main(input_path, csv_output_path):
                             status = event_data.get('Status', 'N/A')
                             message = event_data.get('Message', 'N/A')
 
+                            # Извлекаем LogonID (TargetLogonId или SubjectLogonId)
+                            logon_id = event_data.get('TargetLogonId', 'N/A')
+                            if logon_id == 'N/A':
+                                logon_id = event_data.get('SubjectLogonId', 'N/A')
+
                             # Записываем строку в CSV
                             writer.writerow({
                                 'RowID': row_id,
@@ -178,6 +184,7 @@ def main(input_path, csv_output_path):
                                 'AccessMask': access_mask,
                                 'Status': status,
                                 'Message': message,
+                                'LogonID': logon_id,
                                 'RawXML': cleaned_xml,
                                 'File': os.path.basename(evtx_path)
                             })
