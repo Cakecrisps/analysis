@@ -88,6 +88,22 @@ def classify_suspicious_domain(domain):
     return reasons
 
 
+def count_packets_safely(pcap_path):
+    """Безопасно подсчитывает количество пакетов в PCAP файле"""
+    try:
+        cap = pyshark.FileCapture(pcap_path, keep_packets=False)
+        count = 0
+        try:
+            for _ in cap:
+                count += 1
+        except:
+            # Если файл поврежден, просто возвращаем текущий счетчик
+            pass
+        return count
+    except:
+        return 0
+
+
 def analyze_single_pcap_file(pcap_path, ignore_local_ips, protocols_to_detail):
     """Анализирует один PCAP файл и возвращает собранные данные"""
     print(f"[INFO] Анализируем файл: {pcap_path}")
@@ -111,128 +127,135 @@ def analyze_single_pcap_file(pcap_path, ignore_local_ips, protocols_to_detail):
     try:
         cap = pyshark.FileCapture(pcap_path, keep_packets=False)
         for pkt in cap:
-            # Подсчет протоколов
-            if hasattr(pkt, 'transport_layer'):
-                protocol_stats[pkt.transport_layer] = protocol_stats.get(pkt.transport_layer, 0) + 1
-            else:
-                # Если нет транспортного слоя, проверяем другие протоколы
-                for layer in pkt.layers:
-                    protocol_stats[str(layer.layer_name)] = protocol_stats.get(str(layer.layer_name), 0) + 1
+            try:
+                # Подсчет протоколов
+                if hasattr(pkt, 'transport_layer'):
+                    protocol_stats[pkt.transport_layer] = protocol_stats.get(pkt.transport_layer, 0) + 1
+                else:
+                    # Если нет транспортного слоя, проверяем другие протоколы
+                    for layer in pkt.layers:
+                        protocol_stats[str(layer.layer_name)] = protocol_stats.get(str(layer.layer_name), 0) + 1
 
-            # Обработка IP-адресов
-            if 'IP' in pkt:
-                src_ip = pkt.ip.src
-                dst_ip = pkt.ip.dst
+                # Обработка IP-адресов
+                if 'IP' in pkt:
+                    src_ip = pkt.ip.src
+                    dst_ip = pkt.ip.dst
 
-                # Проверяем, нужно ли игнорировать локальные IP
-                if not ignore_local_ips or not is_local_ip(src_ip):
-                    src_ips.append(src_ip)
-                    unique_ips.add(src_ip)
-                if not ignore_local_ips or not is_local_ip(dst_ip):
-                    dst_ips.append(dst_ip)
-                    unique_ips.add(dst_ip)
+                    # Проверяем, нужно ли игнорировать локальные IP
+                    if not ignore_local_ips or not is_local_ip(src_ip):
+                        src_ips.append(src_ip)
+                        unique_ips.add(src_ip)
+                    if not ignore_local_ips or not is_local_ip(dst_ip):
+                        dst_ips.append(dst_ip)
+                        unique_ips.add(dst_ip)
 
-                # Проверка на подозрительные IP
-                if src_ip in SUSPICIOUS_IPS:
-                    suspicious_ips.add(src_ip)
-                if dst_ip in SUSPICIOUS_IPS:
-                    suspicious_ips.add(dst_ip)
+                    # Проверка на подозрительные IP
+                    if src_ip in SUSPICIOUS_IPS:
+                        suspicious_ips.add(src_ip)
+                    if dst_ip in SUSPICIOUS_IPS:
+                        suspicious_ips.add(dst_ip)
 
-            # Обработка DNS
-            if 'DNS' in pkt and hasattr(pkt.dns, 'qry_name'):
-                domain = str(pkt.dns.qry_name)
-                dns_queries.append(domain)
-                domain_count[domain] += 1
+                # Обработка DNS
+                if 'DNS' in pkt and hasattr(pkt.dns, 'qry_name'):
+                    domain = str(pkt.dns.qry_name)
+                    dns_queries.append(domain)
+                    domain_count[domain] += 1
 
-                # Проверка на подозрительность
-                reasons = classify_suspicious_domain(domain)
-                if reasons:
-                    timestamp = str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown"
-                    suspicious_domains.append({
-                        'domain': domain,
-                        'time': timestamp,
-                        'reasons': reasons,
-                        'src_ip': getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown',
-                        'file': os.path.basename(pcap_path)  # Добавляем имя файла
-                    })
-
-            # Обработка NetBIOS Name Service (NBNS)
-            if 'NBNS' in pkt:
-                if hasattr(pkt.nbns, 'name'):
-                    nbns_query = str(pkt.nbns.name)
-                    nbns_queries.append(nbns_query)
-
-                    # Проверяем на подозрительность
-                    reasons = classify_suspicious_domain(nbns_query)
+                    # Проверка на подозрительность
+                    reasons = classify_suspicious_domain(domain)
                     if reasons:
                         timestamp = str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown"
                         suspicious_domains.append({
-                            'domain': nbns_query,
+                            'domain': domain,
                             'time': timestamp,
                             'reasons': reasons,
                             'src_ip': getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown',
-                            'protocol': 'NBNS',
-                            'file': os.path.basename(pcap_path)
+                            'file': os.path.basename(pcap_path)  # Добавляем имя файла
                         })
 
-            # Обработка HTTP (если есть)
-            if 'HTTP' in pkt and hasattr(pkt.http, 'request_full_uri'):
-                uri = str(pkt.http.request_full_uri)
-                # Извлечём домен из URI
-                match = re.search(r'https?://([^/]+)', uri)
-                if match:
-                    domain = match.group(1)
-                    if domain not in http_requests:
-                        http_requests[domain] = []
-                    http_requests[domain].append({
-                        'uri': uri,
-                        'time': str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown",
-                        'file': os.path.basename(pcap_path)
-                    })
+                # Обработка NetBIOS Name Service (NBNS)
+                if 'NBNS' in pkt:
+                    if hasattr(pkt.nbns, 'name'):
+                        nbns_query = str(pkt.nbns.name)
+                        nbns_queries.append(nbns_query)
 
-            # Обработка SMB/SMB2 (если есть)
-            if 'SMB' in pkt or 'SMB2' in pkt:
-                smb_layer = pkt.smb if 'SMB' in pkt else pkt.smb2
-                src_ip = getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown'
-                dst_ip = getattr(pkt.ip, 'dst', 'unknown') if 'IP' in pkt else 'unknown'
+                        # Проверяем на подозрительность
+                        reasons = classify_suspicious_domain(nbns_query)
+                        if reasons:
+                            timestamp = str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown"
+                            suspicious_domains.append({
+                                'domain': nbns_query,
+                                'time': timestamp,
+                                'reasons': reasons,
+                                'src_ip': getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown',
+                                'protocol': 'NBNS',
+                                'file': os.path.basename(pcap_path)
+                            })
 
-                # Попытка извлечь имя пользователя из SMB/SMB2
-                username = 'unknown'
-                if hasattr(smb_layer, 'ntlmssp_auth_username'):
-                    username = str(smb_layer.ntlmssp_auth_username)
-                elif hasattr(smb_layer, 'ntlmssp_username'):
-                    username = str(smb_layer.ntlmssp_username)
-
-                if username != 'unknown':
-                    timestamp = str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown"
-                    protocol = 'SMB' if 'SMB' in pkt else 'SMB2'
-                    login_attempts.append({
-                        'src_ip': src_ip,
-                        'dst_ip': dst_ip,
-                        'username': username,
-                        'protocol': protocol,
-                        'time': timestamp,
-                        'file': os.path.basename(pcap_path)
-                    })
-
-            # Детализация по протоколам
-            for protocol in protocols_to_detail:
-                if protocol.upper() in pkt:
-                    layer = getattr(pkt, protocol.lower(), None)
-                    if layer:
-                        detailed_protocols[protocol].append({
-                            'src_ip': getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown',
-                            'dst_ip': getattr(pkt.ip, 'dst', 'unknown') if 'IP' in pkt else 'unknown',
-                            'src_port': getattr(pkt[protocol.upper()], 'srcport', 'unknown'),
-                            'dst_port': getattr(pkt[protocol.upper()], 'dstport', 'unknown'),
+                # Обработка HTTP (если есть)
+                if 'HTTP' in pkt and hasattr(pkt.http, 'request_full_uri'):
+                    uri = str(pkt.http.request_full_uri)
+                    # Извлечём домен из URI
+                    match = re.search(r'https?://([^/]+)', uri)
+                    if match:
+                        domain = match.group(1)
+                        if domain not in http_requests:
+                            http_requests[domain] = []
+                        http_requests[domain].append({
+                            'uri': uri,
                             'time': str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown",
-                            'info': str(layer),
                             'file': os.path.basename(pcap_path)
                         })
+
+                # Обработка SMB/SMB2 (если есть)
+                if 'SMB' in pkt or 'SMB2' in pkt:
+                    smb_layer = pkt.smb if 'SMB' in pkt else pkt.smb2
+                    src_ip = getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown'
+                    dst_ip = getattr(pkt.ip, 'dst', 'unknown') if 'IP' in pkt else 'unknown'
+
+                    # Попытка извлечь имя пользователя из SMB/SMB2
+                    username = 'unknown'
+                    if hasattr(smb_layer, 'ntlmssp_auth_username'):
+                        username = str(smb_layer.ntlmssp_auth_username)
+                    elif hasattr(smb_layer, 'ntlmssp_username'):
+                        username = str(smb_layer.ntlmssp_username)
+
+                    if username != 'unknown':
+                        timestamp = str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown"
+                        protocol = 'SMB' if 'SMB' in pkt else 'SMB2'
+                        login_attempts.append({
+                            'src_ip': src_ip,
+                            'dst_ip': dst_ip,
+                            'username': username,
+                            'protocol': protocol,
+                            'time': timestamp,
+                            'file': os.path.basename(pcap_path)
+                        })
+
+                # Детализация по протоколам
+                for protocol in protocols_to_detail:
+                    if protocol.upper() in pkt:
+                        layer = getattr(pkt, protocol.lower(), None)
+                        if layer:
+                            detailed_protocols[protocol].append({
+                                'src_ip': getattr(pkt.ip, 'src', 'unknown') if 'IP' in pkt else 'unknown',
+                                'dst_ip': getattr(pkt.ip, 'dst', 'unknown') if 'IP' in pkt else 'unknown',
+                                'src_port': getattr(pkt[protocol.upper()], 'srcport', 'unknown'),
+                                'dst_port': getattr(pkt[protocol.upper()], 'dstport', 'unknown'),
+                                'time': str(pkt.sniff_time) if hasattr(pkt, 'sniff_time') else "unknown",
+                                'info': str(layer),
+                                'file': os.path.basename(pcap_path)
+                            })
+            except Exception as e:
+                # Пропускаем поврежденные пакеты
+                continue
 
     except Exception as e:
         print(f"[ERROR] Ошибка при анализе пакета в файле {pcap_path}: {e}")
         return None
+
+    # Безопасно подсчитываем количество пакетов
+    total_packets = count_packets_safely(pcap_path)
 
     return {
         'src_ips': src_ips,
@@ -247,7 +270,7 @@ def analyze_single_pcap_file(pcap_path, ignore_local_ips, protocols_to_detail):
         'protocol_stats': protocol_stats,
         'login_attempts': login_attempts,
         'detailed_protocols': detailed_protocols,
-        'total_packets': len(list(pyshark.FileCapture(pcap_path, keep_packets=False)))
+        'total_packets': total_packets
     }
 
 
